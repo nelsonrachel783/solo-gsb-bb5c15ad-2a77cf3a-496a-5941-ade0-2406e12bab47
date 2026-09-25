@@ -8,7 +8,8 @@
 - **跨币种换算**：按请求汇率换算，原币金额完整保留，目标币独立做最小单位舍入与残差分配。
 - **收款登记**：按发票登记收款（发票币种字符串、必须大于 0），随时查询收款记录与未收余额；累计收款不得超过含税总额，校验与写入在同一 SQLite 事务中完成，并发不会超收。
 - **收款冲销**：`POST /api/v1/payments/{payment_id}/reversals` 对已登记的收款流水冲销（可同一笔分次冲销，累计不得超过原收款）；冲销记录单独持久化、不删除原收款，未收余额、逾期查询与后续来款分配一律按**净入账额**（收款 − 冲销）计算，累计校验与写入在同一 SQLite 写事务内完成，并发冲销不会超额。
-- **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
+- **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。分配成功时在同一事务内保存**分配批次**（批次标识 `allocation_batch_id`）与本次生成的各条收款关联，并在响应中返回批次标识；每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
+- **来款分配整批撤销**：`POST /api/v1/payment-allocation-batches/{batch_id}/reversal` 按批次撤销一次跨发票来款分配。在**同一个写事务**内对批次内每笔收款逐笔计算净入账额（收款 − 已有冲销，含手工冲销与既往撤销），**仅对正余额追加等额冲销**，撤销后各笔净入账额归零、发票未收余额全部回升；**重复请求幂等**——不新增任何冲销，仍返回各笔撤销金额（`reversed_amount`）与批次合计（`reversed_total`）。首次撤销 `201`，重复请求 `200`；批次不存在返回 `404`。旧的无批次收款（单张登记或历史版本的来款分配）仍可通过原冲销接口 `POST /api/v1/payments/{payment_id}/reversals` 查询与冲销，不受影响。
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **历史收款快照**：`GET /api/v1/invoices/{id}/payment-snapshot?at=...` 返回单张发票在指定 UTC 时点（必填、秒精度 `YYYY-MM-DDTHH:MM:SSZ`，截止秒为闭区间、同秒流水全部计入）的收款总额、冲销总额、净已收与未收余额；只统计该时点之前及当秒的流水，截止后的流水不改变历史结果，金额全程按发票币种最小单位用 `Decimal` 计算。
 - **分期回款计划**：`POST /api/v1/invoices/{id}/installment-plan` 为单张发票创建**唯一一份**分期计划，提交按到期日升序排列的期次与金额（每期为币种最小单位的正数，期次合计须等于含税总额，校验与写入在同一 SQLite 事务内完成）；`GET .../installment-plan?as_of=...` 查询时把当前**净已收额（收款 − 冲销）按期次顺序逐期 FIFO 抵扣**，返回每期已覆盖额、未覆盖额，仅到期日严格早于查询日（缺省 UTC 当日）的未覆盖额计为逾期额。冲销后再查自动反映重新打开的期次，**原计划永不改写**。
@@ -83,6 +84,10 @@ curl -s -X POST http://localhost:8000/api/v1/payments/1/reversals \
 curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
   -H 'Content-Type: application/json' \
   -d '{"currency": "USD", "amount": "50.00", "invoice_ids": [1, 2, 3]}'
+
+# 按批次整批撤销上一次来款分配（用分配响应中的 allocation_batch_id）
+# 同一写事务内逐笔按净入账额追加冲销；重复请求幂等（首次 201、再次 200）
+curl -s -X POST http://localhost:8000/api/v1/payment-allocation-batches/1/reversal
 
 # 查询已逾期且仍有未收余额的发票（as_of 缺省取 UTC 当前日期）
 curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of=2026-10-15'
@@ -218,7 +223,8 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录（含各流水已冲销金额与净入账额）与未收余额 |
 | `GET` | `/api/v1/invoices/{id}/payment-snapshot?at=...` | 单张发票在指定 UTC 时点（必填、秒精度）的历史收款快照：收款/冲销总额、净已收与未收余额 |
 | `POST` | `/api/v1/payments/{payment_id}/reversals` | 冲销一笔收款（可分次，累计不超过原收款），`201` |
-| `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
+| `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201`；响应返回批次标识 `allocation_batch_id` |
+| `POST` | `/api/v1/payment-allocation-batches/{batch_id}/reversal` | 按批次整批撤销来款分配（逐笔按净入账额追加等额冲销、重复请求幂等）；首次 `201`、重复 `200`、批次不存在 `404` |
 | `POST` | `/api/v1/invoices/{id}/installment-plan` | 为单张发票创建唯一一份分期回款计划（期次按到期日升序、合计等于含税总额），`201`；已存在计划 `409` |
 | `GET` | `/api/v1/invoices/{id}/installment-plan?as_of=...` | 查询分期计划：净已收额逐期 FIFO 抵扣，返回每期已覆盖/未覆盖/逾期额；无计划 `404` |
 | `POST` | `/api/v1/invoice-number-check` | 供应商发票号码批次查重（1~500 条，NFKC 规范化后同供应商内判重），返回重复组 |
@@ -562,6 +568,7 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
   "amount": "50.00",
   "allocated_total": "50.00",
   "created_at": "2026-09-23T03:00:00Z",
+  "allocation_batch_id": 7,
   "allocations": [
     {"invoice_id": 2, "due_date": "2026-09-05", "allocated": "22.00",
      "outstanding": "0.00", "payment_id": 10},
@@ -579,6 +586,86 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
 - `payment_id` 指向沿用现有 `payments` 表写入的流水 ID；分配为 `0` 时为 `null`。
   因此 `GET /api/v1/invoices/{id}/payments` 与逾期分页查询都能看到分配结果，
   与单张收款登记完全一致。
+- `allocation_batch_id` 为本次来款分配的**批次标识**：分配成功时服务在同一事务内
+  保存批次头与本次生成的各条收款关联（仅分配金额 > 0 的流水入批次），可用
+  `POST /api/v1/payment-allocation-batches/{allocation_batch_id}/reversal`
+  整批撤销本次分配（见下）。
+
+#### 3.7.1 来款分配整批撤销 `POST /api/v1/payment-allocation-batches/{batch_id}/reversal`
+
+对一次跨发票来款分配做整批撤销（退款、来款认领错误等场景），无需逐笔收集
+`payment_id`：路径参数 `batch_id` 即分配响应中的 `allocation_batch_id`。请求体为空。
+
+撤销规则（全部在**同一个 `BEGIN IMMEDIATE` 写事务**内完成，与收款登记、手工冲销、
+其他来款分配/撤销串行化）：
+
+1. 按批次条目逐笔定位分配时生成的收款流水，计算每笔的**净入账额**
+   = 原收款金额 − 该流水已有冲销合计（已有冲销包含手工冲销与既往批次撤销）；
+2. **仅对净入账额 > 0 的流水追加一条金额等于该净入账额的冲销**
+   （写入 `payment_reversals`，并以 `allocation_batch_id` 标记来源批次）；
+   净入账额已为 0 的流水（此前已手工冲销或已撤销过）**不新增任何冲销**；
+3. 撤销后批次内每笔收款的净入账额均归 0，各发票未收余额相应全部回升、可重新进入
+   逾期列表并被后续收款/来款分配再次使用；任一异常整体回滚，不留半批冲销。
+
+**幂等**：对同一批次重复请求不会新增冲销记录。响应逐笔返回：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries[].payment_amount` | 该笔原收款（本次分配）金额 |
+| `entries[].reversed_before` | 本次撤销前该流水的全部已冲销合计（手工冲销 + 既往批次撤销） |
+| `entries[].reversed_now` | 本次实际新追加的冲销金额（净入账额为 0 时为 `0.00`，不新增冲销） |
+| `entries[].reversed_amount` | **本批次**对该笔累计追加的撤销金额；重复请求保持稳定，不随手工冲销变化 |
+| `entries[].net_amount` | 撤销后该流水的净入账额（原收款 − 全部冲销） |
+| `reversed_total` | 各笔 `reversed_amount` 的批次合计 |
+| `reversed` / `reversed_count` | 本次请求是否新追加冲销 / 新追加的冲销条数 |
+| `reversed_at` | 该批次**首次**整批撤销的登记时间（重复请求保持不变） |
+
+状态码：首次撤销（有新增冲销）返回 **`201`**；重复请求（幂等、本次无新增冲销）
+返回 **`200`**；批次不存在返回 **`404`**（中文错误说明中含批次 ID）。
+
+```bash
+# 首次整批撤销批次 7（假设此前手工冲销过其中一笔的 5.00）
+curl -s -X POST http://localhost:8000/api/v1/payment-allocation-batches/7/reversal
+```
+
+```json
+{
+  "allocation_batch_id": 7,
+  "currency": "USD",
+  "amount": "50.00",
+  "created_at": "2026-09-23T03:00:00Z",
+  "reversed": true,
+  "reversed_count": 3,
+  "reversed_at": "2026-09-23T06:00:00Z",
+  "reversed_total": "45.00",
+  "entries": [
+    {"payment_id": 10, "invoice_id": 2, "payment_amount": "22.00",
+     "reversed_before": "0.00", "reversed_now": "22.00",
+     "reversed_amount": "22.00", "net_amount": "0.00"},
+    {"payment_id": 11, "invoice_id": 1, "payment_amount": "11.00",
+     "reversed_before": "5.00", "reversed_now": "6.00",
+     "reversed_amount": "6.00", "net_amount": "0.00"},
+    {"payment_id": 12, "invoice_id": 4, "payment_amount": "17.00",
+     "reversed_before": "0.00", "reversed_now": "17.00",
+     "reversed_amount": "17.00", "net_amount": "0.00"}
+  ]
+}
+```
+
+上例中批次来款 50.00（22+11+17），其中 11.00 那笔此前已手工冲销 5.00，撤销时只
+追加净入账额 6.00，故批次合计 `reversed_total` 为 22+6+17 = **45.00**（而非
+50.00）；该发票的全部冲销合计（手工 5 + 批次 6）仍为 11.00。对同一批次再次请求
+返回 `200`，`reversed=false`、`reversed_count=0`、各笔 `reversed_now` 均为
+`0.00`，而 `reversed_amount` / `reversed_total` 仍稳定返回 `45.00`。
+
+批次撤销追加的冲销与手工冲销同处 `payment_reversals` 表，因此历史收款快照、
+应收账龄、分期计划 FIFO 抵扣等所有按净入账额计算的视图在撤销后自动反映回升的
+未收额。JPY 等 0 位小数币种的撤销金额同样不带小数位（如 `"reversed_total": "600"`）。
+
+> **旧数据兼容**：升级前已存在的无批次收款（单张登记、历史版本的来款分配流水）
+> 不属于任何批次，仍可通过原接口 `GET /api/v1/invoices/{id}/payments` 查询、
+> `POST /api/v1/payments/{payment_id}/reversals` 逐笔冲销；这些流水的冲销记录
+> `allocation_batch_id` 为空。只有新版本分配接口生成的批次才能整批撤销。
 
 ### 3.8 分期回款计划
 
@@ -958,7 +1045,7 @@ curl -s 'http://localhost:8000/api/v1/receivables/aging?as_of=2030-01-15'
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、分期计划创建/查询、贷项凭证创建/查询、来款分配时列表中任一 id 不存在）；发票尚未创建分期计划时查询计划；冲销时收款流水 `payment_id` 不存在 |
+| `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、分期计划创建/查询、贷项凭证创建/查询、来款分配时列表中任一 id 不存在）；发票尚未创建分期计划时查询计划；冲销时收款流水 `payment_id` 不存在；按批次整批撤销时来款分配批次不存在 |
 | `409` | 为已存在分期回款计划的发票再次创建计划（每张发票只允许一份） |
 | `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of`（逾期查询、分期计划查询、应收账龄汇总）不是合法 ISO 日期、分期期次为空、期次到期日未按升序排列、期次金额 ≤ 0 或非最小单位正整数倍、期次合计不等于含税总额、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、贷项凭证明细为空/行号非正或重复、引用不存在或净额非正的原行、本次抵扣净额 ≤ 0 或非最小单位正整数倍、同一原行历次累计抵扣超过原行净额、分页参数越界、发票号码查重批次为空或超过 500 条/供应商编号为空/原始发票号码为空或超过 100 个 Unicode 字符等（响应体 `detail` 为中文说明或 FastAPI 校验错误列表） |
 
@@ -1025,11 +1112,11 @@ python -m unittest tests.test_api -v
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
 │   ├── duplicates.py  # 发票号码查重纯函数：NFKC + 去首尾空白 + casefold 规范化，同供应商内分组判重
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照 / 分期计划 / 发票号码查重 / 贷项凭证 / 应收账龄汇总模型）
-│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配 + 分期计划 + 贷项凭证）/ 查询（含逾期、历史快照、分期 FIFO 抵扣、贷项凭证累计汇总与应收账龄汇总，WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配与批次整批撤销 / 历史快照 / 分期计划 / 发票号码查重 / 贷项凭证 / 应收账龄汇总模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配批次 + 批次整批撤销 + 分期计划 + 贷项凭证）/ 查询（含逾期、历史快照、分期 FIFO 抵扣、贷项凭证累计汇总与应收账龄汇总，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询、历史收款快照、分期回款计划、发票号码批次查重、贷项凭证多行抵扣与税额摊算、应收账龄汇总分桶与截止口径）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、来款分配整批撤销（逐笔净额追加冲销/手工部分冲销/幂等重复/批次 404/并发撤销不重复/JPY）、到期日与逾期查询、历史收款快照、分期回款计划、发票号码批次查重、贷项凭证多行抵扣与税额摊算、应收账龄汇总分桶与截止口径）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -1039,23 +1126,34 @@ python -m unittest tests.test_api -v
 存储模型：`invoices`（发票头 + 汇总金额 + 可选到期日 `due_date` + 原始请求 JSON，
 供复算）、`invoice_lines`（逐行最终税额/含税及换算列）、`payments`（收款登记：
 金额、币种、登记时间）、`payment_reversals`（收款冲销：金额、币种、登记时间，
-外键关联 `payments.id`）、`installment_plans`（分期计划头，`invoice_id` 上有
-唯一约束保证每张发票至多一份）与 `installment_plan_items`（计划期次：期次号、
-到期日、金额，外键级联删除）、`credit_memos`（原发票贷项凭证头：关联发票、
-币种与本次抵扣净额/税额/含税额合计、登记时间，外键级联删除）与
-`credit_memo_lines`（凭证行：原行号、本次抵扣净额/税额/含税额、抵扣后累计净额/
-税额，`UNIQUE(memo_id, line_no)` 兜底同凭证行号不重复）八张表。冲销不改动原
-收款流水，余额一律按净入账额（收款 − 冲销）实时计算。来款分配不引入新表：
-每张被抵扣的发票向 `payments` 写入一条同构流水（整笔失败则全部不写），因此
-单张收款查询与逾期查询天然可见分配结果，分配产生的流水同样可以被冲销。分期
-计划一经创建**不再改写**：每期覆盖/逾期状态在查询时用净已收额按期次顺序 FIFO
-实时抵扣得出，冲销后重新查询即反映重新打开的期次。贷项凭证只追加、从不回写
-`invoices` / `invoice_lines` / `payments` / `payment_reversals`：原发票逐行与
-汇总金额、未收余额、逾期结果、分期计划视图在开具凭证前后完全一致；逐原行
-累计抵扣与剩余净额由 `credit_memo_lines` 在查询时实时汇总。应收账龄汇总不引入新表：
-直接复用 `invoices` / `payments` / `payment_reversals` 按查询日 UTC 结束时点实时
-计算未收额并分桶，同一 `as_of` 重复查询结果恒定。升级到含 `due_date`
-/ `payment_reversals` / 分期计划 / 贷项凭证的版本时，服务启动会自动对旧库执行
-`ALTER TABLE ... ADD COLUMN due_date` 与 `CREATE TABLE IF NOT EXISTS`，历史发票
-的到期日为空、不会出现在逾期结果中，历史收款无冲销记录、净入账额等于原收款
-金额，历史发票无分期计划、查询返回 404，历史发票无贷项凭证、查询返回空列表。
+外键关联 `payments.id`；`allocation_batch_id` 标记由来款分配整批撤销追加的冲销，
+手工冲销与历史无批次冲销该列为 NULL）、`payment_allocation_batches`（来款分配
+批次头：币种、来款金额、批次创建时间）与 `payment_allocation_entries`（批次内
+本次实际生成的收款关联：批次 → 收款流水/发票/分配金额，`payment_id` 上有唯一
+约束保证一条流水至多属于一个批次，外键级联删除）、`installment_plans`（分期
+计划头，`invoice_id` 上有唯一约束保证每张发票至多一份）与
+`installment_plan_items`（计划期次：期次号、到期日、金额，外键级联删除）、
+`credit_memos`（原发票贷项凭证头：关联发票、币种与本次抵扣净额/税额/含税额
+合计、登记时间，外键级联删除）与 `credit_memo_lines`（凭证行：原行号、本次
+抵扣净额/税额/含税额、抵扣后累计净额/税额，`UNIQUE(memo_id, line_no)` 兜底同
+凭证行号不重复）十张表。冲销不改动原收款流水，余额一律按净入账额（收款 − 冲销）
+实时计算。来款分配成功时在同一事务额外写入批次头与收款关联并回传
+`allocation_batch_id`；整批撤销在同一写事务内逐笔按净入账额向
+`payment_reversals` 追加等额冲销（以 `allocation_batch_id` 标记），重复请求不
+新增冲销，旧的无批次收款仍走原逐笔冲销接口。每张被抵扣的发票向 `payments`
+写入一条同构流水（整笔失败则全部不写），因此单张收款查询与逾期查询天然可见
+分配结果，分配产生的流水同样可以被手工冲销。分期计划一经创建**不再改写**：
+每期覆盖/逾期状态在查询时用净已收额按期次顺序 FIFO 实时抵扣得出，冲销后重新
+查询即反映重新打开的期次。贷项凭证只追加、从不回写 `invoices` /
+`invoice_lines` / `payments` / `payment_reversals`：原发票逐行与汇总金额、
+未收余额、逾期结果、分期计划视图在开具凭证前后完全一致；逐原行累计抵扣与剩余
+净额由 `credit_memo_lines` 在查询时实时汇总。应收账龄汇总不引入新表：直接复用
+`invoices` / `payments` / `payment_reversals` 按查询日 UTC 结束时点实时计算
+未收额并分桶，同一 `as_of` 重复查询结果恒定。升级到含 `due_date`
+/ `payment_reversals` / 分期计划 / 贷项凭证 / 来款分配批次的版本时，服务启动
+会自动对旧库执行 `ALTER TABLE ... ADD COLUMN due_date`、
+`ALTER TABLE payment_reversals ADD COLUMN allocation_batch_id` 与
+`CREATE TABLE IF NOT EXISTS`，历史发票的到期日为空、不会出现在逾期结果中，
+历史收款无冲销记录、净入账额等于原收款金额，历史发票无分期计划、查询返回 404，
+历史发票无贷项凭证、查询返回空列表，历史来款分配无批次、仍可按原逐笔接口查询
+与冲销，但不能按批次整批撤销。

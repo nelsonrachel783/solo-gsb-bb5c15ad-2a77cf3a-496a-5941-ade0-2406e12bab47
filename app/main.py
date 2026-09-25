@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import db as database
@@ -32,6 +32,7 @@ from .schemas import (
     InvoiceResult,
     PagedInvoices,
     PagedOverdueInvoices,
+    PaymentAllocationBatchReversalResult,
     PaymentAllocationCreate,
     PaymentAllocationResult,
     PaymentCreate,
@@ -56,12 +57,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
         "收款冲销（分次冲销、按净入账额计算余额）、"
-        "一笔来款在多张同币种待结发票间按到期日顺序分配、"
+        "一笔来款在多张同币种待结发票间按到期日顺序分配（分配成功保存批次标识、"
+        "支持按批次整批撤销：同一写事务内逐笔按净入账额追加等额冲销、重复请求幂等）、"
         "到期日（due_date）与逾期发票分页查询、"
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
         "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
@@ -380,7 +382,14 @@ def allocate_payment(
     payload: PaymentAllocationCreate,
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict[str, Any]:
-    """一笔来款在多张待结发票间按到期日顺序分配，整笔成功或整笔拒绝。"""
+    """一笔来款在多张待结发票间按到期日顺序分配，整笔成功或整笔拒绝。
+
+    分配成功时在同一事务内保存来款分配批次（批次标识
+    ``allocation_batch_id``）及本次生成的各条收款关联，并在响应中返回批次
+    标识；可用
+    ``POST /api/v1/payment-allocation-batches/{allocation_batch_id}/reversal``
+    整批撤销本次分配。
+    """
 
     amount = to_decimal(payload.amount, "amount")
     if amount <= 0:
@@ -392,6 +401,44 @@ def allocate_payment(
         )
     except database.InvoiceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/payment-allocation-batches/{batch_id}/reversal",
+    response_model=PaymentAllocationBatchReversalResult,
+    responses={
+        201: {"description": "首次整批撤销：本次新追加了一笔或多笔冲销"},
+        200: {"description": "幂等重复请求：本次无新增冲销（各笔净入账额均已为 0）"},
+        404: {"description": "来款分配批次不存在"},
+    },
+    tags=["payments"],
+)
+def reverse_allocation_batch(
+    batch_id: int,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """按批次整批撤销一次跨发票来款分配。
+
+    在**同一个写事务**内对批次内每笔收款流水逐笔计算净入账额（收款 − 已有
+    冲销，含手工冲销与既往撤销），**仅对正余额追加等额冲销**；净入账额已为
+    0 的流水（此前已手工冲销或已撤销过）不新增冲销。撤销后各笔净入账额归零、
+    发票未收余额全部回升，可再次登记收款或重新分配。
+
+    **幂等**：对同一批次重复请求不会新增任何冲销，仍逐笔返回该笔的批次撤销
+    金额（``reversed_amount``）与批次合计（``reversed_total``）。首次撤销
+    返回 ``201``，重复请求（本次无新增冲销）返回 ``200``。批次不存在返回
+    ``404``。旧的无批次收款（单张登记或历史版本的来款分配）仍可通过原接口
+    ``POST /api/v1/payments/{payment_id}/reversals`` 查询与冲销，不受影响。
+    """
+
+    try:
+        result = database.reverse_allocation_batch(conn, batch_id)
+    except database.AllocationBatchNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # 本次新追加了冲销 -> 201；重复请求（幂等、无新增）-> 200
+    response.status_code = 201 if result["reversed"] else 200
+    return result
 
 
 @app.get(

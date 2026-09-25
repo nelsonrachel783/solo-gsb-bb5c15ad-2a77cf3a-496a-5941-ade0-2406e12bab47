@@ -299,6 +299,10 @@ class PaymentAllocationResult(BaseModel):
     amount: str
     allocated_total: str
     created_at: str
+    allocation_batch_id: int = Field(
+        description="本次来款分配的批次标识；可用 "
+        "POST /api/v1/payment-allocation-batches/{id}/reversal 整批撤销"
+    )
     allocations: list[PaymentAllocationItem]
 
 
@@ -398,6 +402,47 @@ class ReversalResult(BaseModel):
     created_at: str
     reversed_total: str
     net_amount: str
+
+
+class PaymentAllocationBatchReversalEntry(BaseModel):
+    """整批撤销中一笔收款流水的撤销结果。"""
+
+    model_config = ConfigDict(extra="allow")
+    payment_id: int = Field(description="分配时生成的收款流水 ID")
+    invoice_id: int
+    payment_amount: str = Field(description="原收款（本次分配）金额")
+    reversed_before: str = Field(
+        description="本次撤销前该流水的全部已冲销合计（手工冲销 + 既往批次撤销）"
+    )
+    reversed_now: str = Field(
+        description="本次实际新追加的冲销金额（净入账额为 0 时为 0，不新增冲销）"
+    )
+    reversed_amount: str = Field(
+        description="本批次对该流水累计追加的撤销金额；重复请求保持稳定"
+    )
+    net_amount: str = Field(
+        description="撤销后该流水的净入账额（原收款 − 全部冲销）"
+    )
+
+
+class PaymentAllocationBatchReversalResult(BaseModel):
+    """来款分配整批撤销的响应：逐笔撤销金额与批次合计。
+
+    同一批次重复请求时不新增任何冲销：``reversed`` 为 ``false``、
+    ``reversed_count`` 为 0，逐笔 ``reversed_now`` 均为 ``0``；
+    ``reversed_amount`` / ``reversed_total`` 仍稳定返回本批次累计撤销金额。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    allocation_batch_id: int
+    currency: str
+    amount: str = Field(description="分配批次的来款总金额")
+    created_at: str = Field(description="分配批次创建时间")
+    reversed: bool = Field(description="本次请求是否新追加了冲销（重复请求为 false）")
+    reversed_count: int = Field(description="本次新追加的冲销记录条数")
+    reversed_at: str = Field(description="该批次首次整批撤销的登记时间")
+    reversed_total: str = Field(description="本批次各笔撤销金额合计")
+    entries: list[PaymentAllocationBatchReversalEntry]
 
 
 # ---- 逾期查询 ----
