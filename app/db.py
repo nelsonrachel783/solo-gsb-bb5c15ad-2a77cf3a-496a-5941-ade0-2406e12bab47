@@ -1,11 +1,16 @@
 """SQLite 持久化层。
 
-存储八张表：
+存储十张表：
 * ``invoices``          —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
 * ``invoice_lines``     —— 逐行结果（税额残差分配后的最终值，含换算列）；
 * ``payments``          —— 收款登记（每笔收款的金额、币种与登记时间）；
 * ``payment_reversals`` —— 收款冲销（每笔冲销的金额、币种与登记时间，
   关联原收款流水；原收款不删除，余额一律按净入账额 = 收款 − 冲销 计算）；
+* ``payment_allocation_batches``      —— 跨发票来款分配批次头（批次币种、来款金额、
+  创建时间），每次 ``POST /payment-allocations`` 成功生成一个批次，响应回显批次 id；
+* ``payment_allocation_batch_items``  —— 批次明细表：批次内本次**实际生成**的收款关联
+  （批次 + 收款流水 + 发票、本次分配金额、抵扣顺序序号、整批撤销生成的冲销流水 id）；
+  ``payment_id`` 唯一，一条收款至多属于一个批次，旧的无批次收款不在本表中，仍可按原接口冲销；
 * ``installment_plans``      —— 分期回款计划头（每张发票至多一份，invoice_id 唯一）；
 * ``installment_plan_items`` —— 计划期次（期次号、到期日、金额，按期次号升序），
   期次金额合计等于发票含税总额；查询时不改写计划，覆盖/逾期状态实时按净已收额计算；
@@ -85,6 +90,32 @@ CREATE TABLE IF NOT EXISTS payment_reversals (
 
 CREATE INDEX IF NOT EXISTS idx_payment_reversals_payment_id ON payment_reversals(payment_id);
 
+-- 跨发票来款分配批次：一次分配成功生成一个批次头
+CREATE TABLE IF NOT EXISTS payment_allocation_batches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    amount     TEXT NOT NULL,
+    currency   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 批次明细：只登记批次内实际生成（allocated > 0）的收款关联。
+-- payment_id 唯一：一条收款至多属于一个批次（含其整批撤销的冲销归属）；
+-- reversal_id 记录整批撤销为该收款生成的那一条冲销（最多一条），
+-- 旧的手工冲销不计入；SET NULL 兜底：即使冲销流水被级联删除，明细仍保留。
+CREATE TABLE IF NOT EXISTS payment_allocation_batch_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES payment_allocation_batches(id) ON DELETE CASCADE,
+    payment_id  INTEGER NOT NULL UNIQUE REFERENCES payments(id) ON DELETE CASCADE,
+    invoice_id  INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    allocated   TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    reversal_id INTEGER UNIQUE REFERENCES payment_reversals(id) ON DELETE SET NULL,
+    UNIQUE(batch_id, payment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_allocation_batch_items_batch_id
+    ON payment_allocation_batch_items(batch_id);
+
 -- 每张发票至多一份分期回款计划：invoice_id 上的唯一约束是并发兜底
 CREATE TABLE IF NOT EXISTS installment_plans (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +180,14 @@ class PaymentNotFoundError(Exception):
     def __init__(self, payment_id: int) -> None:
         self.payment_id = payment_id
         super().__init__(f"收款流水 {payment_id} 不存在")
+
+
+class AllocationBatchNotFoundError(Exception):
+    """整批撤销时来款分配批次不存在。"""
+
+    def __init__(self, batch_id: int) -> None:
+        self.batch_id = batch_id
+        super().__init__(f"来款分配批次 {batch_id} 不存在")
 
 
 class PlanAlreadyExistsError(Exception):
@@ -630,11 +669,18 @@ def allocate_payment(
     每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。未收余额按
     **净入账额**（收款 − 冲销）计算，冲销释放的余额可以再次被分配。
 
+    成功时在**同一事务**内额外保存：
+
+    * ``payment_allocation_batches`` 批次头一条（批次标识即其自增 id），响应回显
+      ``batch_id``；
+    * ``payment_allocation_batch_items`` 批次明细：本次每笔实际生成（allocated > 0）
+      的收款关联（批次 + 收款流水 + 发票、金额、抵扣顺序序号），供整批撤销使用。
+
     使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`、
     :func:`reverse_payment` 及彼此的来款分配请求串行化：「读发票/净入账合计 ->
-    校验 -> 写入多条 payments」在同一事务内完成，并发收款不会超收。
+    校验 -> 写入批次头、多条 payments、批次明细」在同一事务内完成，并发收款不会超收。
 
-    任一前置条件不满足都回滚，**不留下任何收款记录**：
+    任一前置条件不满足都回滚，**不留下任何收款记录与批次记录**：
 
     * 列表中任一发票不存在 -> :class:`InvoiceNotFoundError`
     * 来款金额 ≤ 0、不是币种最小单位整数倍 -> ``ValueError``
@@ -642,6 +688,7 @@ def allocate_payment(
     * 列表内发票未收余额合计 < 来款金额 -> ``ValueError``
     """
 
+    batch_id: int | None = None
     conn.execute("BEGIN IMMEDIATE")
     try:
         # 调用方（schema 层）已保证列表非空且无重复，这里再防御性校验一次，
@@ -706,12 +753,23 @@ def allocate_payment(
 
         remaining = amount
         created_at = utc_now_iso()
+        # 批次头与收款流水、批次明细在同一事务内写入；批次 id 用于整批撤销
+        batch_cur = conn.execute(
+            """
+            INSERT INTO payment_allocation_batches (amount, currency, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (format(amount, "f"), currency, created_at),
+        )
+        batch_id = int(batch_cur.lastrowid)
         items: list[dict[str, Any]] = []
+        seq = 0
         for invoice_id in ordered_ids:
             due = outstanding[invoice_id]
             allocated = remaining if remaining < due else due
             payment_id: int | None = None
             if allocated > 0:
+                seq += 1
                 cur = conn.execute(
                     """
                     INSERT INTO payments (invoice_id, amount, currency, created_at)
@@ -720,6 +778,15 @@ def allocate_payment(
                     (invoice_id, format(allocated, "f"), currency, created_at),
                 )
                 payment_id = int(cur.lastrowid)
+                # 记录本次生成的收款关联（批次撤销据此逐笔冲销）
+                conn.execute(
+                    """
+                    INSERT INTO payment_allocation_batch_items (
+                        batch_id, payment_id, invoice_id, allocated, seq, reversal_id
+                    ) VALUES (?, ?, ?, ?, ?, NULL)
+                    """,
+                    (batch_id, payment_id, invoice_id, format(allocated, "f"), seq),
+                )
                 remaining -= allocated
             items.append(
                 {
@@ -739,12 +806,182 @@ def allocate_payment(
         raise
 
     return {
+        "batch_id": batch_id,
         "currency": currency,
         "amount": format(amount, "f"),
         "allocated_total": format(amount, "f"),
         "created_at": created_at,
         "allocations": items,
     }
+
+
+def reverse_allocation_batch(
+    conn: sqlite3.Connection, batch_id: int
+) -> tuple[dict[str, Any], bool]:
+    """整批撤销一次跨发票来款分配，全部计算与写入在 **同一个写事务** 内完成。
+
+    逐笔处理批次明细（``seq`` 升序，即原分配抵扣顺序）中本次生成的收款关联：
+
+    1. 计算该收款当前的**净入账额** = 原收款金额 − 其全部已有冲销
+       （既包含整批撤销已生成的冲销，也包含通过
+       ``POST /payments/{id}/reversals`` 做的手工冲销）；
+    2. **仅对正余额（净入账额 > 0）追加一条等额冲销**，并把冲销流水 id 回写到
+       批次明细的 ``reversal_id``；净入账额已为 0（已被手工冲销完，或本批次此前
+       已撤销过）则**不新增任何冲销**。
+
+    因此接口天然**幂等**：第一次请求为仍有正余额的收款各追加一条冲销；重复请求
+    时这些收款净入账额已为 0，不会新增第二条冲销。返回各笔的**撤销金额**（本次
+    新增时为其当时正余额；重复请求时沿用批次明细 ``reversal_id`` 已记录冲销的金额）、
+    撤销后的净入账额，以及批次合计。
+
+    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`、
+    :func:`reverse_payment`、:func:`allocate_payment` 串行化，并发整批撤销/手工冲销
+    不会对同一收款超额冲销。
+
+    返回 ``(结果字典, created)``：``created`` 为本次是否**新写入了至少一条冲销**
+    （首次撤销通常为 ``True``，重复请求或批次收款此前已全部手工冲完时为 ``False``）。
+
+    * 批次不存在 -> :class:`AllocationBatchNotFoundError`
+    """
+
+    created = False
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        batch = conn.execute(
+            "SELECT id, amount, currency, created_at"
+            " FROM payment_allocation_batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if batch is None:
+            raise AllocationBatchNotFoundError(batch_id)
+
+        item_rows = list(
+            conn.execute(
+                """
+                SELECT bi.seq AS seq, bi.payment_id AS payment_id,
+                       bi.invoice_id AS invoice_id, bi.allocated AS allocated,
+                       bi.reversal_id AS reversal_id,
+                       p.amount AS payment_amount,
+                       i.currency_digits AS currency_digits
+                FROM payment_allocation_batch_items bi
+                JOIN payments p ON p.id = bi.payment_id
+                JOIN invoices i ON i.id = bi.invoice_id
+                WHERE bi.batch_id = ?
+                ORDER BY bi.seq
+                """,
+                (batch_id,),
+            ).fetchall()
+        )
+        payment_ids = [int(r["payment_id"]) for r in item_rows]
+        reversed_map = _reversed_totals(conn, payment_ids)
+
+        # 批次明细此前已记录的整批撤销冲销（重复请求时回显其金额/流水号/时间）
+        prior_reversal_ids = [
+            int(r["reversal_id"]) for r in item_rows if r["reversal_id"] is not None
+        ]
+        prior_rows: dict[int, sqlite3.Row] = {}
+        if prior_reversal_ids:
+            placeholders = ",".join("?" for _ in prior_reversal_ids)
+            prior_rows = {
+                int(r["id"]): r
+                for r in conn.execute(
+                    f"SELECT id, amount, created_at FROM payment_reversals"
+                    f" WHERE id IN ({placeholders})",
+                    prior_reversal_ids,
+                ).fetchall()
+            }
+
+        created_at = utc_now_iso()
+        result_items: list[dict[str, Any]] = []
+        batch_reversed_total = Decimal("0")
+        for r in item_rows:
+            payment_id = int(r["payment_id"])
+            item_unit = _minor_unit(int(r["currency_digits"]))
+            original = Decimal(r["payment_amount"])
+            net_before = (
+                original - reversed_map.get(payment_id, Decimal("0"))
+            ).quantize(item_unit)
+
+            reversal_id = r["reversal_id"]
+            if net_before > 0:
+                # 正余额：追加一条等额冲销（净余额为最小单位整数倍，天然不超额）
+                cur = conn.execute(
+                    """
+                    INSERT INTO payment_reversals (payment_id, amount, currency, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (payment_id, format(net_before, "f"), batch["currency"], created_at),
+                )
+                reversal_id = int(cur.lastrowid)
+                conn.execute(
+                    "UPDATE payment_allocation_batch_items SET reversal_id = ?"
+                    " WHERE batch_id = ? AND payment_id = ?",
+                    (reversal_id, batch_id, payment_id),
+                )
+                reversed_map[payment_id] = (
+                    reversed_map.get(payment_id, Decimal("0")) + net_before
+                )
+                this_amount = net_before
+                this_created_at: str | None = created_at
+                created = True
+                net_after = Decimal("0").quantize(item_unit)
+            elif reversal_id is not None:
+                # 重复请求：沿用本批次此前已生成的冲销，不新增
+                prior = prior_rows[int(reversal_id)]
+                this_amount = Decimal(prior["amount"]).quantize(item_unit)
+                this_created_at = prior["created_at"]
+                net_after = net_before  # 已为 0
+            else:
+                # 批次撤销前该收款已被手工冲销完：本批次不产生冲销
+                this_amount = Decimal("0").quantize(item_unit)
+                this_created_at = None
+                net_after = net_before  # 已为 0
+
+            batch_reversed_total += this_amount
+            result_items.append(
+                {
+                    "seq": int(r["seq"]),
+                    "payment_id": payment_id,
+                    "invoice_id": int(r["invoice_id"]),
+                    "allocated": Decimal(r["allocated"]).quantize(item_unit),
+                    "reversal_id": reversal_id,
+                    "reversed_amount": this_amount,
+                    "reversal_created_at": this_created_at,
+                    "net_amount": net_after,
+                }
+            )
+
+        digits = int(item_rows[0]["currency_digits"]) if item_rows else 2
+        unit = _minor_unit(digits)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    items_out = [
+        {
+            "seq": it["seq"],
+            "payment_id": it["payment_id"],
+            "invoice_id": it["invoice_id"],
+            "allocated": format(it["allocated"], "f"),
+            "reversed_amount": format(it["reversed_amount"], "f"),
+            "reversal_id": it["reversal_id"],
+            "reversal_created_at": it["reversal_created_at"],
+            "net_amount": format(it["net_amount"], "f"),
+            "currency": batch["currency"],
+        }
+        for it in result_items
+    ]
+    result = {
+        "batch_id": batch_id,
+        "currency": batch["currency"],
+        "created_at": batch["created_at"],
+        "allocated_total": batch["amount"],
+        "reversed_total": format(batch_reversed_total.quantize(unit), "f"),
+        "reversal_count": sum(1 for it in items_out if it["reversal_id"] is not None),
+        "items": items_out,
+    }
+    return result, created
 
 
 def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:

@@ -2283,6 +2283,219 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["as_of"], today)
         self.assertEqual(body["cutoff_at"], f"{today}T23:59:59Z")
 
+    def test_38_allocation_batch_reversal(self) -> None:
+        # 跨发票来款分配 -> 保存批次并回显 batch_id；按批次整笔撤销；
+        # 重复请求幂等不新增冲销；手工部分冲销后只撤销净余额；
+        # 不存在批次 404；旧的无批次收款仍按原接口冲销。
+        def make_invoice(gross: str, due_date: str | None) -> int:
+            payload = {"currency": "USD", "lines": [{"net": gross, "tax_rate": "0"}]}
+            if due_date is not None:
+                payload["due_date"] = due_date
+            status, inv = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, inv)
+            return inv["id"]
+
+        # 三张发票：到期日决定分配顺序 x(09-01) -> y(09-02) -> z(09-03)
+        id_x = make_invoice("10.00", "2026-09-01")
+        id_y = make_invoice("20.00", "2026-09-02")
+        id_z = make_invoice("30.00", "2026-09-03")
+
+        # 旧的无批次收款（先于批次存在）：稍后验证其仍可按原接口冲销
+        status, old_pay = self._request(
+            "POST", f"/api/v1/invoices/{id_x}/payments", {"amount": "5.00"}
+        )
+        self.assertEqual(status, 201, old_pay)
+        old_payment_id = old_pay["id"]
+
+        # 来款 50.00 分配到三张发票（剩余未收：x 5、y 20、z 30，合计 55）
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "50.00",
+             "invoice_ids": [id_z, id_y, id_x]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertIsInstance(body["batch_id"], int)
+        batch_id = body["batch_id"]
+        self.assertEqual(body["allocated_total"], "50.00")
+        allocs = body["allocations"]
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["payment_id"] is not None)
+             for it in allocs],
+            [(id_x, "5.00", True), (id_y, "20.00", True), (id_z, "25.00", True)],
+        )
+        pay_x, pay_y, pay_z = (it["payment_id"] for it in allocs)
+
+        # 撤销前各发票余额
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_x}/payments")
+        self.assertEqual(ov["paid_total"], "10.00")
+        self.assertEqual(ov["outstanding"], "0.00")
+
+        # 先手工部分冲销批次内 y 的收款 8.00：整批撤销时 y 只应再冲净余额 12.00
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pay_y}/reversals", {"amount": "8.00"}
+        )
+        self.assertEqual(status, 201, rev)
+
+        # 不存在的批次 -> 404，明确错误
+        status, resp = self._request(
+            "POST", "/api/v1/payment-allocation-batches/999999/reversals"
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("999999", resp["detail"])
+
+        # 首次整批撤销 -> 201
+        status, body = self._request(
+            "POST", f"/api/v1/payment-allocation-batches/{batch_id}/reversals"
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["batch_id"], batch_id)
+        self.assertEqual(body["currency"], "USD")
+        self.assertEqual(body["allocated_total"], "50.00")
+        # x 冲 5（净 5）、y 冲 12（净 20−8 手工）、z 冲 25 -> 合计 42
+        self.assertEqual(body["reversed_total"], "42.00")
+        self.assertEqual(body["reversal_count"], 3)
+        items = body["items"]
+        self.assertEqual(
+            [(it["seq"], it["invoice_id"], it["payment_id"],
+              it["allocated"], it["reversed_amount"], it["net_amount"])
+             for it in items],
+            [
+                (1, id_x, pay_x, "5.00", "5.00", "0.00"),
+                (2, id_y, pay_y, "20.00", "12.00", "0.00"),
+                (3, id_z, pay_z, "25.00", "25.00", "0.00"),
+            ],
+        )
+        for it in items:
+            self.assertIsInstance(it["reversal_id"], int)
+            self.assertTrue(it["reversal_created_at"].endswith("Z"))
+            self.assertEqual(it["currency"], "USD")
+        rev_x_id = items[0]["reversal_id"]
+        rev_y_id = items[1]["reversal_id"]
+        rev_z_id = items[2]["reversal_id"]
+
+        # 撤销后发票未收余额按净入账额回升（x 上还有无批次的旧收款 5.00 净入账）
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_x}/payments")
+        self.assertEqual(ov["paid_total"], "5.00")
+        self.assertEqual(ov["reversed_total"], "5.00")
+        self.assertEqual(ov["outstanding"], "5.00")
+        by_pid = {p["id"]: p for p in ov["payments"]}
+        self.assertEqual(by_pid[pay_x]["reversed_total"], "5.00")
+        self.assertEqual(by_pid[pay_x]["net_amount"], "0.00")
+        self.assertEqual(by_pid[old_payment_id]["reversed_total"], "0.00")
+
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_y}/payments")
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["reversed_total"], "20.00")
+        self.assertEqual(ov["outstanding"], "20.00")
+
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_z}/payments")
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["outstanding"], "30.00")
+
+        # 重复请求 -> 200，内容恒定，不新增冲销（reversal_id 与首次一致）
+        status, again = self._request(
+            "POST", f"/api/v1/payment-allocation-batches/{batch_id}/reversals"
+        )
+        self.assertEqual(status, 200, again)
+        self.assertEqual(again["reversed_total"], "42.00")
+        self.assertEqual(again["reversal_count"], 3)
+        self.assertEqual(
+            [it["reversed_amount"] for it in again["items"]],
+            ["5.00", "12.00", "25.00"],
+        )
+        self.assertEqual(
+            [it["reversal_id"] for it in again["items"]],
+            [rev_x_id, rev_y_id, rev_z_id],
+        )
+        for it in again["items"]:
+            self.assertEqual(it["net_amount"], "0.00")
+
+        # 第三次请求同样幂等
+        status, third = self._request(
+            "POST", f"/api/v1/payment-allocation-batches/{batch_id}/reversals"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(third, again)
+
+        # 旧的无批次收款仍可按原接口查询与冲销
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_x}/payments")
+        old = next(p for p in ov["payments"] if p["id"] == old_payment_id)
+        self.assertEqual(old["net_amount"], "5.00")
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{old_payment_id}/reversals",
+            {"amount": "5.00"},
+        )
+        self.assertEqual(status, 201, rev)
+        self.assertEqual(rev["reversed_total"], "5.00")
+        self.assertEqual(rev["net_amount"], "0.00")
+
+        # 批次撤销释放的余额可被新的来款分配再次使用
+        # 此刻未收：x 10（旧收款已手工冲完）、y 20、z 30 -> 合计 60
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "60.00",
+             "invoice_ids": [id_x, id_y, id_z]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["allocated_total"], "60.00")
+        self.assertIsInstance(body["batch_id"], int)
+        self.assertNotEqual(body["batch_id"], batch_id)
+        for inv_id in (id_x, id_y, id_z):
+            status, ov = self._request("GET", f"/api/v1/invoices/{inv_id}/payments")
+            self.assertEqual(ov["outstanding"], "0.00", inv_id)
+
+    def test_39_allocation_batch_reversal_already_manual_reversed(self) -> None:
+        # 批次内收款在整批撤销前已被手工全额冲销：撤销返回 200、
+        # 该笔 reversed_amount 为 0.00、reversal_id 为 null，且不新增冲销
+        def make_invoice(gross: str) -> int:
+            status, inv = self._request(
+                "POST", "/api/v1/invoices",
+                {"currency": "JPY", "lines": [{"net": gross, "tax_rate": "0"}]},
+            )
+            self.assertEqual(status, 201, inv)
+            return inv["id"]
+
+        id_a = make_invoice("100")
+        id_b = make_invoice("200")
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "JPY", "amount": "300", "invoice_ids": [id_a, id_b]},
+        )
+        self.assertEqual(status, 201, body)
+        batch_id = body["batch_id"]
+        pay_a, pay_b = (it["payment_id"] for it in body["allocations"])
+
+        # 两笔批次收款都在撤销前手工冲完
+        amount_by_pid = {it["payment_id"]: it["allocated"] for it in body["allocations"]}
+        for pid in (pay_a, pay_b):
+            status, rev = self._request(
+                "POST", f"/api/v1/payments/{pid}/reversals",
+                {"amount": amount_by_pid[pid]},
+            )
+            self.assertEqual(status, 201, rev)
+
+        status, result = self._request(
+            "POST", f"/api/v1/payment-allocation-batches/{batch_id}/reversals"
+        )
+        self.assertEqual(status, 200, result)  # 无新增 -> 200
+        self.assertEqual(result["reversed_total"], "0")
+        self.assertEqual(result["reversal_count"], 0)
+        for it in result["items"]:
+            self.assertEqual(it["reversed_amount"], "0")
+            self.assertIsNone(it["reversal_id"])
+            self.assertIsNone(it["reversal_created_at"])
+            self.assertEqual(it["net_amount"], "0")
+
+        # 重复请求仍幂等
+        status, again = self._request(
+            "POST", f"/api/v1/payment-allocation-batches/{batch_id}/reversals"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(again, result)
+
 
 if __name__ == "__main__":
     unittest.main()

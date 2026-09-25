@@ -20,6 +20,7 @@ from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .duplicates import find_duplicates
 from .schemas import (
+    AllocationBatchReversalResult,
     CreditMemoCreate,
     CreditMemoOverview,
     CreditMemoResult,
@@ -56,12 +57,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
         "收款冲销（分次冲销、按净入账额计算余额）、"
-        "一笔来款在多张同币种待结发票间按到期日顺序分配、"
+        "一笔来款在多张同币种待结发票间按到期日顺序分配（分配成功返回批次标识，"
+        "支持按批次幂等整批撤销：同事务内按净入账额逐笔追加等额冲销）、"
         "到期日（due_date）与逾期发票分页查询、"
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
         "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
@@ -380,7 +382,13 @@ def allocate_payment(
     payload: PaymentAllocationCreate,
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict[str, Any]:
-    """一笔来款在多张待结发票间按到期日顺序分配，整笔成功或整笔拒绝。"""
+    """一笔来款在多张待结发票间按到期日顺序分配，整笔成功或整笔拒绝。
+
+    成功时在同一事务内保存**分配批次**（``payment_allocation_batches``）及本次
+    实际生成的收款关联（``payment_allocation_batch_items``），响应回显批次标识
+    ``batch_id``，可用于整批撤销（见
+    ``POST /api/v1/payment-allocation-batches/{batch_id}/reversals``）。
+    """
 
     amount = to_decimal(payload.amount, "amount")
     if amount <= 0:
@@ -392,6 +400,45 @@ def allocate_payment(
         )
     except database.InvoiceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/payment-allocation-batches/{batch_id}/reversals",
+    response_model=AllocationBatchReversalResult,
+    status_code=201,
+    responses={
+        200: {"model": AllocationBatchReversalResult},
+        404: {"description": "来款分配批次不存在"},
+    },
+    tags=["payments"],
+)
+def reverse_allocation_batch(
+    batch_id: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> JSONResponse:
+    """按批次整笔撤销一次跨发票来款分配（**幂等**，可安全重复请求）。
+
+    在**同一个 ``BEGIN IMMEDIATE`` 写事务**内，按原分配抵扣顺序逐笔计算每笔收款的
+    净入账额（收款 − 其全部已有冲销，既含本接口此前生成的冲销，也含通过
+    ``POST /payments/{payment_id}/reversals`` 做的手工冲销）：
+
+    * **仅对正余额（净入账额 > 0）追加一条等额冲销**，并把冲销流水关联回批次明细；
+    * 净入账额已为 0 的收款**不新增冲销**——批次已撤销过则沿用已记录的冲销，
+      批次撤销前已被手工冲销完则该笔撤销金额为 ``0``、``reversal_id`` 为 ``null``。
+
+    因此**重复请求不新增任何冲销**，返回内容恒定：逐笔撤销金额 ``reversed_amount``、
+    撤销后净入账额 ``net_amount`` 及批次合计 ``reversed_total``。首次实际写入冲销时
+    返回 ``201``；重复请求（或批次收款此前已全部手工冲完、本次无新增）返回 ``200``。
+    冲销与单张收款的手工冲销同表同口径，撤销后各发票未收余额按净入账额回升，可被
+    后续收款/来款分配再次使用。批次不存在返回 ``404``。旧的无批次收款不在批次明细中，
+    仍可通过原冲销接口逐笔查询与冲销。
+    """
+
+    try:
+        result, created = database.reverse_allocation_batch(conn, batch_id)
+    except database.AllocationBatchNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(status_code=201 if created else 200, content=result)
 
 
 @app.get(

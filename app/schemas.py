@@ -292,14 +292,48 @@ class PaymentAllocationItem(BaseModel):
 
 
 class PaymentAllocationResult(BaseModel):
-    """来款分配成功后的响应：逐发票分配金额与剩余余额。"""
+    """来款分配成功后的响应：批次标识、逐发票分配金额与剩余余额。"""
 
     model_config = ConfigDict(extra="allow")
+    batch_id: int
     currency: str
     amount: str
     allocated_total: str
     created_at: str
     allocations: list[PaymentAllocationItem]
+
+
+class AllocationBatchReversalItem(BaseModel):
+    """整批撤销结果中一笔被分配收款的撤销明细（按原分配抵扣顺序）。"""
+
+    model_config = ConfigDict(extra="allow")
+    seq: int
+    payment_id: int
+    invoice_id: int
+    allocated: str
+    reversed_amount: str
+    reversal_id: int | None = None
+    reversal_created_at: str | None = None
+    net_amount: str
+    currency: str
+
+
+class AllocationBatchReversalResult(BaseModel):
+    """按批次整笔撤销来款分配的结果：逐笔撤销金额与批次合计。
+
+    幂等：同一批次重复撤销不会新增冲销——撤销前净入账额（收款 − 已有冲销，
+    含手工冲销）已为 0 的收款不再追加冲销，其撤销金额沿用本批次已记录的冲销；
+    批次撤销前已被手工冲销完的收款撤销金额为 ``0.00``、``reversal_id`` 为 ``null``。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    batch_id: int
+    currency: str
+    created_at: str
+    allocated_total: str
+    reversed_total: str
+    reversal_count: int
+    items: list[AllocationBatchReversalItem]
 
 
 class PaymentOverview(BaseModel):
